@@ -27,6 +27,7 @@ Audio output: 24kHz mono PCM float32 (VoxCPM2 native)
 """
 
 import asyncio
+import ctypes
 import io
 import json
 import logging
@@ -35,6 +36,36 @@ import re
 import shutil
 import time
 import uuid
+
+# ---------------------------------------------------------------------------
+# Fix: ensure libnvrtc-builtins.so.13.0 is findable by VoxCPM2's snake kernel.
+# The cu13 library ships with the nvidia-cu13 Python package but isn't on the
+# default LD_LIBRARY_PATH on RunPod images. Pre-load it so nvrtc can open it.
+# ---------------------------------------------------------------------------
+_NVRTC_BUILTINS_CANDIDATES = [
+    "/usr/local/lib/python3.11/dist-packages/nvidia/cu13/lib",
+    "/usr/local/lib/python3.11/dist-packages/nvidia/cuda_nvrtc/lib",
+    "/usr/local/lib/ollama/mlx_cuda_v13",
+]
+
+def _fix_nvrtc_library_path():
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    additions = [p for p in _NVRTC_BUILTINS_CANDIDATES if os.path.isdir(p)]
+    if additions:
+        new_path = ":".join(additions + ([existing] if existing else []))
+        os.environ["LD_LIBRARY_PATH"] = new_path
+        # Also try to pre-load the library so the dynamic linker caches it
+        for candidate_dir in additions:
+            for name in ("libnvrtc-builtins.so.13.0", "libnvrtc-builtins.so"):
+                lib_path = os.path.join(candidate_dir, name)
+                if os.path.exists(lib_path):
+                    try:
+                        ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+                    except OSError:
+                        pass
+                    break
+
+_fix_nvrtc_library_path()
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
