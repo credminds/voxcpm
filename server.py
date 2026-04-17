@@ -311,6 +311,10 @@ class TTSRequest(BaseModel):
         default=True,
         description="Normalise output loudness.",
     )
+    seed: Optional[int] = Field(
+        default=42,
+        description="Random seed for reproducible output. None = random each time.",
+    )
 
 
 class VoiceUpdateRequest(BaseModel):
@@ -555,6 +559,8 @@ async def synthesize_speech(request: TTSRequest):
             f"cfg={request.cfg_value} steps={request.inference_timesteps}"
         )
         t0 = time.time()
+        if request.seed is not None:
+            torch.manual_seed(request.seed)
         with torch.inference_mode():
             wav = _generate_wav(request.text, generate_kwargs)
 
@@ -609,6 +615,8 @@ async def synthesize_speech_stream(request: TTSRequest):
             first_chunk = True
             t0 = time.time()
 
+            if request.seed is not None:
+                torch.manual_seed(request.seed)
             with torch.inference_mode():
                 for chunk in model.generate_streaming(
                     text=request.text, **generate_kwargs
@@ -671,6 +679,8 @@ async def synthesize_speech_stream_wav(request: TTSRequest):
             )
             all_chunks = []
 
+            if request.seed is not None:
+                torch.manual_seed(request.seed)
             with torch.inference_mode():
                 for chunk in model.generate_streaming(
                     text=request.text, **generate_kwargs
