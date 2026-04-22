@@ -32,10 +32,8 @@ import io
 import json
 import logging
 import os
-import queue
 import re
 import shutil
-import threading
 import time
 import uuid
 
@@ -77,7 +75,6 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -176,23 +173,20 @@ def _build_generate_kwargs(
     return kwargs
 
 
-def _do_warmup(voice_id: Optional[str], cfg_value: float, inference_timesteps: int):
+def _do_warmup(voice_id: str, cfg_value: float, inference_timesteps: int):
     """
     Generate one short utterance with this voice to prime VoxCPM2's
     internal reference-audio processing cache.
     The first call with a new reference_wav_path triggers a ~10s compile;
     all subsequent calls are fast (~RTF 0.37).
-
-    Pass voice_id=None to warm the model's built-in default voice.
     """
     warmup_text = "Hello, this is a warmup generation to initialise the voice cache."
     kwargs = _build_generate_kwargs(voice_id, cfg_value, inference_timesteps)
-    label = voice_id or "default"
-    logger.info(f"Warming up voice '{label}'…")
+    logger.info(f"Warming up voice '{voice_id}'…")
     t0 = time.time()
     with torch.inference_mode():
         _ = model.generate(text=warmup_text, **kwargs)
-    logger.info(f"Voice '{label}' warmed up in {time.time() - t0:.2f}s")
+    logger.info(f"Voice '{voice_id}' warmed up in {time.time() - t0:.2f}s")
 
 
 def _generate_wav(text: str, generate_kwargs: dict) -> np.ndarray:
@@ -278,13 +272,6 @@ def _load_model():
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Pre-warm the built-in default voice so the first /tts call without a
-    # voice_id doesn't pay VoxCPM2's ~10s first-generation cost.
-    try:
-        _do_warmup(None, DEFAULT_CFG_VALUE, DEFAULT_TIMESTEPS)
-    except Exception as e:
-        logger.warning(f"Failed to pre-warm default voice: {e}")
-
     # Pre-warm all registered voices so first real call is fast
     count = 0
     for voice_dir in VOICES_DIR.iterdir():
@@ -325,12 +312,8 @@ class TTSRequest(BaseModel):
         description="Normalise output loudness.",
     )
     seed: Optional[int] = Field(
-        default=None,
-        description=(
-            "Random seed for reproducible output. None = random each time. "
-            "NOTE: torch.manual_seed sets a process-global RNG, so under "
-            "concurrent requests the seed is best-effort and not deterministic."
-        ),
+        default=42,
+        description="Random seed for reproducible output. None = random each time.",
     )
 
 
@@ -557,34 +540,32 @@ async def synthesize_speech(request: TTSRequest):
 
     Use voice_id to select a registered voice for cloning.
     Omit voice_id to use VoxCPM2's built-in default voice.
-
-    The blocking GPU call runs in a threadpool so the asyncio event loop
-    stays free to accept and serve other concurrent requests.
     """
     if not model:
         raise HTTPException(status_code=503, detail="Model not loaded")
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
 
-    generate_kwargs = _build_generate_kwargs(
-        request.voice_id, request.cfg_value, request.inference_timesteps
-    )
-
-    def _blocking_generate():
-        t0 = time.time()
-        if request.seed is not None:
-            torch.manual_seed(request.seed)
-        with torch.inference_mode():
-            wav = _generate_wav(request.text, generate_kwargs)
-        wav_bytes = _to_wav_bytes(wav)
-        return wav, wav_bytes, time.time() - t0
+    try:
+        generate_kwargs = _build_generate_kwargs(
+            request.voice_id, request.cfg_value, request.inference_timesteps
+        )
+    except HTTPException:
+        raise
 
     try:
         logger.info(
             f"TTS: '{request.text[:80]}' voice={request.voice_id or 'default'} "
             f"cfg={request.cfg_value} steps={request.inference_timesteps}"
         )
-        wav, wav_bytes, elapsed = await run_in_threadpool(_blocking_generate)
+        t0 = time.time()
+        if request.seed is not None:
+            torch.manual_seed(request.seed)
+        with torch.inference_mode():
+            wav = _generate_wav(request.text, generate_kwargs)
+
+        wav_bytes = _to_wav_bytes(wav)
+        elapsed = time.time() - t0
         logger.info(f"Generated {len(wav)/SAMPLE_RATE:.2f}s audio in {elapsed:.2f}s")
 
         return StreamingResponse(
@@ -612,10 +593,6 @@ async def synthesize_speech_stream(request: TTSRequest):
     Audio is delivered as raw PCM float32 chunks as each piece is generated.
     Typical first-chunk latency: 48-72ms on RTX 4090.
 
-    The blocking sync generator from VoxCPM2 runs in a worker thread and
-    pushes chunks into a queue; the async side pulls from the queue without
-    blocking the event loop, so concurrent stream requests don't serialise.
-
     Audio format: Raw PCM float32, mono, {SAMPLE_RATE}Hz
     """
     if not model:
@@ -623,71 +600,42 @@ async def synthesize_speech_stream(request: TTSRequest):
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
 
-    generate_kwargs = _build_generate_kwargs(
-        request.voice_id, request.cfg_value, request.inference_timesteps
-    )
+    try:
+        generate_kwargs = _build_generate_kwargs(
+            request.voice_id, request.cfg_value, request.inference_timesteps
+        )
+    except HTTPException:
+        raise
 
     async def audio_generator() -> AsyncGenerator[bytes, None]:
-        loop = asyncio.get_running_loop()
-        chunk_q: queue.Queue = queue.Queue(maxsize=32)
-        sentinel = object()
-        error_holder: dict = {}
-
-        def producer():
-            try:
-                if request.seed is not None:
-                    torch.manual_seed(request.seed)
-                with torch.inference_mode():
-                    for chunk in model.generate_streaming(
-                        text=request.text, **generate_kwargs
-                    ):
-                        chunk_q.put(chunk)
-            except Exception as exc:
-                error_holder["err"] = exc
-            finally:
-                chunk_q.put(sentinel)
-
-        logger.info(
-            f"Stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
-        )
-        worker = threading.Thread(target=producer, daemon=True)
-        worker.start()
-
-        first_chunk = True
-        t0 = time.time()
         try:
-            while True:
-                chunk = await loop.run_in_executor(None, chunk_q.get)
-                if chunk is sentinel:
-                    break
-                if first_chunk:
-                    logger.info(f"First chunk in {(time.time()-t0)*1000:.0f}ms")
-                    first_chunk = False
-
-                if isinstance(chunk, torch.Tensor):
-                    chunk = chunk.squeeze().cpu().numpy()
-                chunk = np.asarray(chunk, dtype=np.float32).flatten()
-                chunk = np.clip(chunk, -1.0, 1.0)
-
-                yield chunk.tobytes()
-        finally:
-            # Drain any pending chunks so the worker thread can exit cleanly
-            # if the client disconnected mid-stream.
-            while True:
-                try:
-                    item = chunk_q.get_nowait()
-                except queue.Empty:
-                    break
-                if item is sentinel:
-                    break
-            worker.join(timeout=5.0)
-
-        if "err" in error_holder:
-            logger.error(
-                f"Streaming error: {error_holder['err']}",
-                exc_info=error_holder["err"],
+            logger.info(
+                f"Stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
             )
-            raise error_holder["err"]
+            first_chunk = True
+            t0 = time.time()
+
+            if request.seed is not None:
+                torch.manual_seed(request.seed)
+            with torch.inference_mode():
+                for chunk in model.generate_streaming(
+                    text=request.text, **generate_kwargs
+                ):
+                    if first_chunk:
+                        logger.info(f"First chunk in {(time.time()-t0)*1000:.0f}ms")
+                        first_chunk = False
+
+                    if isinstance(chunk, torch.Tensor):
+                        chunk = chunk.squeeze().cpu().numpy()
+                    chunk = np.asarray(chunk, dtype=np.float32).flatten()
+                    chunk = np.clip(chunk, -1.0, 1.0)
+
+                    yield chunk.tobytes()
+                    await asyncio.sleep(0)
+
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            raise
 
     return StreamingResponse(
         audio_generator(),
@@ -707,55 +655,58 @@ async def synthesize_speech_stream(request: TTSRequest):
 @app.post("/tts/stream/wav")
 async def synthesize_speech_stream_wav(request: TTSRequest):
     """
-    Synthesise via the streaming API, collect all chunks into a single WAV,
-    and deliver the finished WAV file chunked over HTTP.
+    Stream TTS output as a complete WAV file delivered in chunks.
 
-    The entire generation is buffered (WAV needs a known size for the header),
-    so this is *not* lower latency than /tts — use /tts/stream for that.
-    The blocking GPU work runs in a threadpool so the event loop stays free.
+    Collects all streaming chunks, concatenates, normalises, then streams
+    the WAV. Lower latency than /tts for long texts but higher than /tts/stream.
     """
     if not model:
         raise HTTPException(status_code=503, detail="Model not loaded")
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty")
 
-    generate_kwargs = _build_generate_kwargs(
-        request.voice_id, request.cfg_value, request.inference_timesteps
-    )
-
-    def _blocking_generate_wav() -> bytes:
-        if request.seed is not None:
-            torch.manual_seed(request.seed)
-        all_chunks: list[np.ndarray] = []
-        with torch.inference_mode():
-            for chunk in model.generate_streaming(
-                text=request.text, **generate_kwargs
-            ):
-                if isinstance(chunk, torch.Tensor):
-                    chunk = chunk.squeeze().cpu().numpy()
-                all_chunks.append(np.asarray(chunk, dtype=np.float32).flatten())
-        if not all_chunks:
-            return b""
-        full_audio = np.concatenate(all_chunks)
-        return _to_wav_bytes(full_audio)
-
-    logger.info(
-        f"WAV stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
-    )
-
     try:
-        wav_bytes = await run_in_threadpool(_blocking_generate_wav)
-    except Exception as e:
-        logger.error(f"WAV streaming error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {e}")
+        generate_kwargs = _build_generate_kwargs(
+            request.voice_id, request.cfg_value, request.inference_timesteps
+        )
+    except HTTPException:
+        raise
 
     async def wav_generator() -> AsyncGenerator[bytes, None]:
-        buf = io.BytesIO(wav_bytes)
-        while True:
-            data = buf.read(8192)
-            if not data:
-                break
-            yield data
+        try:
+            logger.info(
+                f"WAV stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
+            )
+            all_chunks = []
+
+            if request.seed is not None:
+                torch.manual_seed(request.seed)
+            with torch.inference_mode():
+                for chunk in model.generate_streaming(
+                    text=request.text, **generate_kwargs
+                ):
+                    if isinstance(chunk, torch.Tensor):
+                        chunk = chunk.squeeze().cpu().numpy()
+                    all_chunks.append(np.asarray(chunk, dtype=np.float32).flatten())
+                    await asyncio.sleep(0)
+
+            if not all_chunks:
+                return
+
+            full_audio = np.concatenate(all_chunks)
+            wav_bytes = _to_wav_bytes(full_audio)
+
+            # Stream the WAV in 8KB chunks
+            buf = io.BytesIO(wav_bytes)
+            while True:
+                data = buf.read(8192)
+                if not data:
+                    break
+                yield data
+
+        except Exception as e:
+            logger.error(f"WAV streaming error: {e}", exc_info=True)
+            raise
 
     return StreamingResponse(
         wav_generator(),
