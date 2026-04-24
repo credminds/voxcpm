@@ -262,6 +262,15 @@ async def _stream_chunks_to_queue(text: str, generate_kwargs: dict, seed: Option
     state set up on the main thread at model load time. Moving generation to
     another thread raises AssertionError in cudagraph_trees.
     """
+    # Streaming amplitude control: VoxCPM's raw output tends to swell as a
+    # sentence progresses. /tts hides this via post-hoc peak normalization,
+    # but streaming can't look ahead. We use a simple running-peak AGC:
+    # track the max abs sample we've ever seen in this stream, scale every
+    # chunk so that running peak maps to TARGET. This monotonically ratchets
+    # down — never up — so there are no audible gain jumps.
+    TARGET_PEAK = 0.9
+    running_peak = 1e-6   # avoid div-by-zero; gets replaced on first chunk
+
     lock = _get_gen_lock()
     async with lock:
         if seed is not None:
@@ -272,7 +281,17 @@ async def _stream_chunks_to_queue(text: str, generate_kwargs: dict, seed: Option
             if isinstance(chunk, torch.Tensor):
                 chunk = chunk.squeeze().cpu().numpy()
             arr = np.asarray(chunk, dtype=np.float32).flatten()
+
+            chunk_peak = float(np.abs(arr).max()) if arr.size else 0.0
+            if chunk_peak > running_peak:
+                running_peak = chunk_peak
+            # Scale so the running peak hits TARGET_PEAK. Because running_peak
+            # only grows, the scale factor only shrinks → never a loud jump.
+            scale = TARGET_PEAK / running_peak
+            if scale < 1.0:
+                arr = arr * scale
             arr = np.clip(arr, -1.0, 1.0)
+
             yield arr
             await asyncio.sleep(0)
 
@@ -335,17 +354,17 @@ def _load_model():
     global model, SAMPLE_RATE
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"CUDA available: {torch.cuda.is_available()}, loading VoxCPM2 on {device}…")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}, loading VoxCPM-0.5B on {device}…")
 
     from voxcpm import VoxCPM
-    model = VoxCPM.from_pretrained("openbmb/VoxCPM2", load_denoiser=False)
+    model = VoxCPM.from_pretrained("openbmb/VoxCPM-0.5B", load_denoiser=False)
 
-    # Resolve actual sample rate from model
+    # Resolve actual sample rate from model (VoxCPM-0.5B = 16kHz)
     try:
         SAMPLE_RATE = model.tts_model.sample_rate
     except AttributeError:
-        SAMPLE_RATE = 24000  # fallback
-    logger.info(f"VoxCPM2 loaded. sample_rate={SAMPLE_RATE}")
+        SAMPLE_RATE = 16000  # fallback for 0.5B
+    logger.info(f"VoxCPM-0.5B loaded. sample_rate={SAMPLE_RATE}")
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -407,7 +426,7 @@ async def health_check():
     return {
         "status": "healthy" if model is not None else "unhealthy",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "model": "VoxCPM2 (openbmb/VoxCPM2)",
+        "model": "VoxCPM-0.5B (openbmb/VoxCPM-0.5B)",
         "sample_rate": SAMPLE_RATE,
         "registered_voices": _count_voices(),
         "streaming_supported": True,
@@ -419,7 +438,7 @@ async def root():
     return {
         "service": "VoxCPM2 TTS Service",
         "version": "1.0.0",
-        "model": "openbmb/VoxCPM2",
+        "model": "openbmb/VoxCPM-0.5B",
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "registered_voices": _count_voices(),
         "endpoints": {
