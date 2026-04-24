@@ -229,33 +229,52 @@ def _wav_header(sample_rate: int, num_channels: int = 1, bits: int = 32) -> byte
     )
 
 
+# Serialize GPU generation so no single stream gets starved. Under concurrent
+# load the GPU's effective throughput per stream collapses (11 it/s solo →
+# ~3 it/s at 4-way), which pushes RTF > 1 and causes client-side audio
+# underruns. With the lock, each request runs at full speed; later requests
+# queue briefly but play back smoothly. Raise GEN_CONCURRENCY to 2+ only
+# if you upgrade the GPU.
+GEN_CONCURRENCY = int(os.getenv("GEN_CONCURRENCY", "1"))
+_GEN_LOCK: Optional[asyncio.Semaphore] = None
+
+
+def _get_gen_lock() -> asyncio.Semaphore:
+    global _GEN_LOCK
+    if _GEN_LOCK is None:
+        _GEN_LOCK = asyncio.Semaphore(GEN_CONCURRENCY)
+    return _GEN_LOCK
+
+
 async def _stream_chunks_to_queue(text: str, generate_kwargs: dict, seed: Optional[int]):
     """
     Iterate model.generate_streaming() on the event-loop thread and yield
     float32 numpy chunks. After each chunk we `await asyncio.sleep(0)` so
     FastAPI can accept/handshake other connections while generation runs.
 
+    Generation is guarded by a semaphore (GEN_CONCURRENCY, default 1) so the
+    GPU serves one stream at full speed instead of N streams at 1/N speed.
+    Without this, concurrent streams run below real-time (RTF > 1) and the
+    client audio buffer underruns — producing choppy playback.
+
     We cannot run generate_streaming() in a worker thread: VoxCPM uses
     torch.compile with CUDA graphs, and graph capture relies on thread-local
     state set up on the main thread at model load time. Moving generation to
     another thread raises AssertionError in cudagraph_trees.
-
-    The event-loop yielding gives us good concurrent TTFB — new requests
-    can start and send their headers while an ongoing generation is
-    producing chunks — but total generation time still serializes on the
-    single GPU.
     """
-    if seed is not None:
-        torch.manual_seed(seed)
-    # Note: model._generate already wraps itself in @torch.inference_mode()
-    gen = model.generate_streaming(text=text, **generate_kwargs)
-    for chunk in gen:
-        if isinstance(chunk, torch.Tensor):
-            chunk = chunk.squeeze().cpu().numpy()
-        arr = np.asarray(chunk, dtype=np.float32).flatten()
-        arr = np.clip(arr, -1.0, 1.0)
-        yield arr
-        await asyncio.sleep(0)
+    lock = _get_gen_lock()
+    async with lock:
+        if seed is not None:
+            torch.manual_seed(seed)
+        # Note: model._generate already wraps itself in @torch.inference_mode()
+        gen = model.generate_streaming(text=text, **generate_kwargs)
+        for chunk in gen:
+            if isinstance(chunk, torch.Tensor):
+                chunk = chunk.squeeze().cpu().numpy()
+            arr = np.asarray(chunk, dtype=np.float32).flatten()
+            arr = np.clip(arr, -1.0, 1.0)
+            yield arr
+            await asyncio.sleep(0)
 
 
 def _to_wav_bytes(wav: np.ndarray) -> bytes:
