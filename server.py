@@ -145,7 +145,6 @@ def _build_generate_kwargs(
     voice_id: Optional[str],
     cfg_value: float,
     inference_timesteps: int,
-    streaming_prefix_len: Optional[int] = None,
 ) -> dict:
     """
     Build keyword arguments for model.generate() / model.generate_streaming().
@@ -158,8 +157,6 @@ def _build_generate_kwargs(
         "cfg_value": cfg_value,
         "inference_timesteps": inference_timesteps,
     }
-    if streaming_prefix_len is not None:
-        kwargs["streaming_prefix_len"] = streaming_prefix_len
 
     if not voice_id or voice_id == "default":
         return kwargs
@@ -389,12 +386,6 @@ class TTSRequest(BaseModel):
     seed: Optional[int] = Field(
         default=42,
         description="Random seed for reproducible output. None = random each time.",
-    )
-    streaming_prefix_len: int = Field(
-        default=4,
-        ge=1,
-        le=16,
-        description="Streaming chunk granularity. Lower = earlier first chunk, more overhead.",
     )
 
 
@@ -686,15 +677,13 @@ async def synthesize_speech_stream(request: TTSRequest):
             request.voice_id,
             request.cfg_value,
             request.inference_timesteps,
-            streaming_prefix_len=request.streaming_prefix_len,
         )
     except HTTPException:
         raise
 
     async def audio_generator() -> AsyncGenerator[bytes, None]:
         logger.info(
-            f"Stream: '{request.text[:80]}' voice={request.voice_id or 'default'} "
-            f"prefix_len={request.streaming_prefix_len}"
+            f"Stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
         )
         t0 = time.time()
         first_chunk = True
@@ -741,15 +730,13 @@ async def synthesize_speech_stream_wav(request: TTSRequest):
             request.voice_id,
             request.cfg_value,
             request.inference_timesteps,
-            streaming_prefix_len=request.streaming_prefix_len,
         )
     except HTTPException:
         raise
 
     async def wav_generator() -> AsyncGenerator[bytes, None]:
         logger.info(
-            f"WAV stream: '{request.text[:80]}' voice={request.voice_id or 'default'} "
-            f"prefix_len={request.streaming_prefix_len}"
+            f"WAV stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
         )
         t0 = time.time()
         first_chunk = True
