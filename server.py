@@ -149,9 +149,10 @@ def _build_generate_kwargs(
     """
     Build keyword arguments for model.generate() / model.generate_streaming().
 
-    If a voice is registered we pass its ref audio.
-    If a transcript is also stored we use the "ultimate cloning" mode
-    (prompt_wav_path + prompt_text), which gives higher voice similarity.
+    VoxCPM-0.5B only supports continuation-mode cloning (prompt_wav_path +
+    prompt_text) — reference_wav_path raises ValueError on this model. So
+    cloning requires a transcript. Voices registered without a transcript
+    cannot clone on 0.5B; the request will 400.
     """
     kwargs: dict = {
         "cfg_value": cfg_value,
@@ -169,14 +170,18 @@ def _build_generate_kwargs(
         )
 
     transcript = _get_transcript(voice_id)
+    if not transcript:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Voice '{voice_id}' has no transcript. VoxCPM-0.5B requires "
+                f"a transcript for cloning. Re-register with the 'transcript' "
+                f"field set to the exact words spoken in the reference audio."
+            ),
+        )
 
-    kwargs["reference_wav_path"] = ref_wav
-
-    if transcript:
-        # Ultimate cloning: same clip used for both prompt and reference
-        kwargs["prompt_wav_path"] = ref_wav
-        kwargs["prompt_text"] = transcript
-
+    kwargs["prompt_wav_path"] = ref_wav
+    kwargs["prompt_text"] = transcript
     return kwargs
 
 
