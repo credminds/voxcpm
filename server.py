@@ -231,45 +231,31 @@ def _wav_header(sample_rate: int, num_channels: int = 1, bits: int = 32) -> byte
 
 async def _stream_chunks_to_queue(text: str, generate_kwargs: dict, seed: Optional[int]):
     """
-    Run model.generate_streaming() in a worker thread, push each chunk into
-    an asyncio.Queue. The route's async generator pulls from the queue,
-    keeping the event loop free for other requests.
+    Iterate model.generate_streaming() on the event-loop thread and yield
+    float32 numpy chunks. After each chunk we `await asyncio.sleep(0)` so
+    FastAPI can accept/handshake other connections while generation runs.
 
-    Yields: np.ndarray float32 chunks (shape: (N,)).
-    Sentinel: None marks end of stream; Exception instance marks error.
+    We cannot run generate_streaming() in a worker thread: VoxCPM uses
+    torch.compile with CUDA graphs, and graph capture relies on thread-local
+    state set up on the main thread at model load time. Moving generation to
+    another thread raises AssertionError in cudagraph_trees.
+
+    The event-loop yielding gives us good concurrent TTFB — new requests
+    can start and send their headers while an ongoing generation is
+    producing chunks — but total generation time still serializes on the
+    single GPU.
     """
-    queue: asyncio.Queue = asyncio.Queue(maxsize=8)
-    loop = asyncio.get_running_loop()
-
-    def producer():
-        try:
-            if seed is not None:
-                torch.manual_seed(seed)
-            # Note: model._generate already wraps itself in @torch.inference_mode()
-            for chunk in model.generate_streaming(text=text, **generate_kwargs):
-                if isinstance(chunk, torch.Tensor):
-                    chunk = chunk.squeeze().cpu().numpy()
-                arr = np.asarray(chunk, dtype=np.float32).flatten()
-                arr = np.clip(arr, -1.0, 1.0)
-                asyncio.run_coroutine_threadsafe(queue.put(arr), loop).result()
-        except Exception as e:
-            asyncio.run_coroutine_threadsafe(queue.put(e), loop).result()
-        finally:
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
-
-    producer_task = loop.run_in_executor(None, producer)
-
-    try:
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                raise item
-            yield item
-    finally:
-        # Ensure the producer is reaped
-        await producer_task
+    if seed is not None:
+        torch.manual_seed(seed)
+    # Note: model._generate already wraps itself in @torch.inference_mode()
+    gen = model.generate_streaming(text=text, **generate_kwargs)
+    for chunk in gen:
+        if isinstance(chunk, torch.Tensor):
+            chunk = chunk.squeeze().cpu().numpy()
+        arr = np.asarray(chunk, dtype=np.float32).flatten()
+        arr = np.clip(arr, -1.0, 1.0)
+        yield arr
+        await asyncio.sleep(0)
 
 
 def _to_wav_bytes(wav: np.ndarray) -> bytes:
