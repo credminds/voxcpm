@@ -145,6 +145,7 @@ def _build_generate_kwargs(
     voice_id: Optional[str],
     cfg_value: float,
     inference_timesteps: int,
+    streaming_prefix_len: Optional[int] = None,
 ) -> dict:
     """
     Build keyword arguments for model.generate() / model.generate_streaming().
@@ -157,6 +158,8 @@ def _build_generate_kwargs(
         "cfg_value": cfg_value,
         "inference_timesteps": inference_timesteps,
     }
+    if streaming_prefix_len is not None:
+        kwargs["streaming_prefix_len"] = streaming_prefix_len
 
     if not voice_id or voice_id == "default":
         return kwargs
@@ -205,6 +208,71 @@ def _generate_wav(text: str, generate_kwargs: dict) -> np.ndarray:
     else:
         wav = np.asarray(wav, dtype=np.float32).squeeze()
     return wav.astype(np.float32)
+
+
+def _wav_header(sample_rate: int, num_channels: int = 1, bits: int = 32) -> bytes:
+    """
+    Build a 44-byte RIFF/WAVE header for streaming WAV. Uses a huge placeholder
+    length so we can start writing PCM before knowing the final size. Players
+    that respect the header's length will read until connection close.
+    """
+    import struct
+    byte_rate = sample_rate * num_channels * bits // 8
+    block_align = num_channels * bits // 8
+    # 0xFFFFFFFF = "stream, length unknown"; most players tolerate it.
+    fake_data_size = 0xFFFFFFFF
+    fake_riff_size = 0xFFFFFFFF
+    audio_format = 3  # IEEE float (since we emit PCM float32)
+    return (
+        b"RIFF" + struct.pack("<I", fake_riff_size) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH",
+                                16, audio_format, num_channels, sample_rate,
+                                byte_rate, block_align, bits)
+        + b"data" + struct.pack("<I", fake_data_size)
+    )
+
+
+async def _stream_chunks_to_queue(text: str, generate_kwargs: dict, seed: Optional[int]):
+    """
+    Run model.generate_streaming() in a worker thread, push each chunk into
+    an asyncio.Queue. The route's async generator pulls from the queue,
+    keeping the event loop free for other requests.
+
+    Yields: np.ndarray float32 chunks (shape: (N,)).
+    Sentinel: None marks end of stream; Exception instance marks error.
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+    loop = asyncio.get_running_loop()
+
+    def producer():
+        try:
+            if seed is not None:
+                torch.manual_seed(seed)
+            # Note: model._generate already wraps itself in @torch.inference_mode()
+            for chunk in model.generate_streaming(text=text, **generate_kwargs):
+                if isinstance(chunk, torch.Tensor):
+                    chunk = chunk.squeeze().cpu().numpy()
+                arr = np.asarray(chunk, dtype=np.float32).flatten()
+                arr = np.clip(arr, -1.0, 1.0)
+                asyncio.run_coroutine_threadsafe(queue.put(arr), loop).result()
+        except Exception as e:
+            asyncio.run_coroutine_threadsafe(queue.put(e), loop).result()
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+    producer_task = loop.run_in_executor(None, producer)
+
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        # Ensure the producer is reaped
+        await producer_task
 
 
 def _to_wav_bytes(wav: np.ndarray) -> bytes:
@@ -321,6 +389,12 @@ class TTSRequest(BaseModel):
     seed: Optional[int] = Field(
         default=42,
         description="Random seed for reproducible output. None = random each time.",
+    )
+    streaming_prefix_len: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description="Streaming chunk granularity. Lower = earlier first chunk, more overhead.",
     )
 
 
@@ -609,37 +683,29 @@ async def synthesize_speech_stream(request: TTSRequest):
 
     try:
         generate_kwargs = _build_generate_kwargs(
-            request.voice_id, request.cfg_value, request.inference_timesteps
+            request.voice_id,
+            request.cfg_value,
+            request.inference_timesteps,
+            streaming_prefix_len=request.streaming_prefix_len,
         )
     except HTTPException:
         raise
 
     async def audio_generator() -> AsyncGenerator[bytes, None]:
+        logger.info(
+            f"Stream: '{request.text[:80]}' voice={request.voice_id or 'default'} "
+            f"prefix_len={request.streaming_prefix_len}"
+        )
+        t0 = time.time()
+        first_chunk = True
         try:
-            logger.info(
-                f"Stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
-            )
-            first_chunk = True
-            t0 = time.time()
-
-            if request.seed is not None:
-                torch.manual_seed(request.seed)
-            with torch.inference_mode():
-                for chunk in model.generate_streaming(
-                    text=request.text, **generate_kwargs
-                ):
-                    if first_chunk:
-                        logger.info(f"First chunk in {(time.time()-t0)*1000:.0f}ms")
-                        first_chunk = False
-
-                    if isinstance(chunk, torch.Tensor):
-                        chunk = chunk.squeeze().cpu().numpy()
-                    chunk = np.asarray(chunk, dtype=np.float32).flatten()
-                    chunk = np.clip(chunk, -1.0, 1.0)
-
-                    yield chunk.tobytes()
-                    await asyncio.sleep(0)
-
+            async for arr in _stream_chunks_to_queue(
+                request.text, generate_kwargs, request.seed
+            ):
+                if first_chunk:
+                    logger.info(f"First chunk in {(time.time()-t0)*1000:.0f}ms")
+                    first_chunk = False
+                yield arr.tobytes()
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
             raise
@@ -648,12 +714,10 @@ async def synthesize_speech_stream(request: TTSRequest):
         audio_generator(),
         media_type="application/octet-stream",
         headers={
-            "Content-Type": "application/octet-stream",
             "X-Audio-Format": "pcm",
             "X-Audio-Encoding": "float32",
             "X-Audio-Sample-Rate": str(SAMPLE_RATE),
             "X-Audio-Channels": "1",
-            "Transfer-Encoding": "chunked",
             "Cache-Control": "no-cache",
         },
     )
@@ -662,10 +726,10 @@ async def synthesize_speech_stream(request: TTSRequest):
 @app.post("/tts/stream/wav")
 async def synthesize_speech_stream_wav(request: TTSRequest):
     """
-    Stream TTS output as a complete WAV file delivered in chunks.
-
-    Collects all streaming chunks, concatenates, normalises, then streams
-    the WAV. Lower latency than /tts for long texts but higher than /tts/stream.
+    True streaming WAV. Emits an IEEE-float32 WAV header with a placeholder
+    length (0xFFFFFFFF) up front, then streams PCM frames as each chunk is
+    generated. First-sound latency matches /tts/stream; most players (browser
+    <audio>, VLC, ffplay) accept the placeholder length.
     """
     if not model:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -674,43 +738,30 @@ async def synthesize_speech_stream_wav(request: TTSRequest):
 
     try:
         generate_kwargs = _build_generate_kwargs(
-            request.voice_id, request.cfg_value, request.inference_timesteps
+            request.voice_id,
+            request.cfg_value,
+            request.inference_timesteps,
+            streaming_prefix_len=request.streaming_prefix_len,
         )
     except HTTPException:
         raise
 
     async def wav_generator() -> AsyncGenerator[bytes, None]:
+        logger.info(
+            f"WAV stream: '{request.text[:80]}' voice={request.voice_id or 'default'} "
+            f"prefix_len={request.streaming_prefix_len}"
+        )
+        t0 = time.time()
+        first_chunk = True
+        yield _wav_header(SAMPLE_RATE, num_channels=1, bits=32)
         try:
-            logger.info(
-                f"WAV stream: '{request.text[:80]}' voice={request.voice_id or 'default'}"
-            )
-            all_chunks = []
-
-            if request.seed is not None:
-                torch.manual_seed(request.seed)
-            with torch.inference_mode():
-                for chunk in model.generate_streaming(
-                    text=request.text, **generate_kwargs
-                ):
-                    if isinstance(chunk, torch.Tensor):
-                        chunk = chunk.squeeze().cpu().numpy()
-                    all_chunks.append(np.asarray(chunk, dtype=np.float32).flatten())
-                    await asyncio.sleep(0)
-
-            if not all_chunks:
-                return
-
-            full_audio = np.concatenate(all_chunks)
-            wav_bytes = _to_wav_bytes(full_audio)
-
-            # Stream the WAV in 8KB chunks
-            buf = io.BytesIO(wav_bytes)
-            while True:
-                data = buf.read(8192)
-                if not data:
-                    break
-                yield data
-
+            async for arr in _stream_chunks_to_queue(
+                request.text, generate_kwargs, request.seed
+            ):
+                if first_chunk:
+                    logger.info(f"WAV stream first chunk in {(time.time()-t0)*1000:.0f}ms")
+                    first_chunk = False
+                yield arr.tobytes()
         except Exception as e:
             logger.error(f"WAV streaming error: {e}", exc_info=True)
             raise
@@ -720,8 +771,10 @@ async def synthesize_speech_stream_wav(request: TTSRequest):
         media_type="audio/wav",
         headers={
             "Content-Disposition": 'attachment; filename="tts_output.wav"',
-            "Transfer-Encoding": "chunked",
             "X-Audio-Sample-Rate": str(SAMPLE_RATE),
+            "X-Audio-Channels": "1",
+            "X-Audio-Encoding": "float32",
+            "Cache-Control": "no-cache",
         },
     )
 
