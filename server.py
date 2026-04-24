@@ -74,6 +74,13 @@ from typing import AsyncGenerator, Optional
 import numpy as np
 import soundfile as sf
 import torch
+
+# Workaround: cuDNN init fails with CUDNN_STATUS_NOT_INITIALIZED on this host
+# (driver 550.127 + bundled cuDNN 9.1). Disable cuDNN; convs fall back to
+# eager CUDA kernels. Opt back in with VOXCPM_ENABLE_CUDNN=1 once fixed.
+if os.getenv("VOXCPM_ENABLE_CUDNN") != "1":
+    torch.backends.cudnn.enabled = False
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
